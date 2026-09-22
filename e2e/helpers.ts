@@ -9,6 +9,18 @@ export function readFixture(name: string): string {
   return readFileSync(join(__dirname, "fixtures", name), "utf8");
 }
 
+/**
+ * A 1,065-point COPC from PDAL's test data — small enough to stream in
+ * seconds, which is why the LiDAR specs use it.
+ *
+ * Pinned to a commit rather than `master`: those specs assert the exact point
+ * count, so an upstream edit would fail them with no product regression. It is
+ * fetched over the network like the other remote data the `features` suite
+ * loads, rather than vendored, so no binary lives in the repository.
+ */
+export const COPC_URL =
+  "https://raw.githubusercontent.com/PDAL/PDAL/3b2942bf5874070bd00f4de2907c90dade2c0a20/test/data/copc/1.2-with-color.copc.laz";
+
 /** Waits for MapLibre to mount its WebGL canvas — the app's "map ready" signal. */
 export async function waitForMap(page: Page, path = "/"): Promise<void> {
   await page.goto(path);
