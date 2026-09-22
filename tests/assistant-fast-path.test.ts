@@ -7,15 +7,17 @@ import {
   fastPathFitsProject,
   interpretFastPathAnswers,
   resolveFastPathAction,
-  resolveFastPathEndpoint,
-  resetFastPathAvailability,
   runToolDirectly,
   FAST_PATH_MAX_CHOICES,
-  TYPESAFE_ENDPOINT,
   type FastPathAnswers,
   type FastPathFetch,
   type FastPathState,
 } from "../apps/geolibre-desktop/src/lib/assistant/fast-path";
+import {
+  resetSystemOneAvailability,
+  resolveSystemOneEndpoint,
+  TYPESAFE_ENDPOINT,
+} from "../apps/geolibre-desktop/src/lib/assistant/system-one";
 
 const STATE: FastPathState = {
   layers: [
@@ -211,7 +213,7 @@ describe("fast-path questions", () => {
 describe("fast-path endpoint", () => {
   it("prefers a managed proxy and sends no credential to it", () => {
     assert.deepEqual(
-      resolveFastPathEndpoint({
+      resolveSystemOneEndpoint({
         GEOLIBRE_AI_PROXY_BASE_URL: "https://ai.geolibre.app/",
         JEV_API_KEY: "personal-key",
       }),
@@ -224,25 +226,25 @@ describe("fast-path endpoint", () => {
     // doubles as an OpenAI-compatible chat base. Appending /systemone to that
     // asked the Worker for /v1/systemone, which 404s — caught end to end.
     assert.deepEqual(
-      resolveFastPathEndpoint({ GEOLIBRE_AI_PROXY_BASE_URL: "https://ai.geolibre.app/v1" }),
+      resolveSystemOneEndpoint({ GEOLIBRE_AI_PROXY_BASE_URL: "https://ai.geolibre.app/v1" }),
       { url: "https://ai.geolibre.app/systemone", apiKey: null },
     );
     assert.deepEqual(
-      resolveFastPathEndpoint({ GEOLIBRE_AI_PROXY_BASE_URL: "http://127.0.0.1:8798/v1/" }),
+      resolveSystemOneEndpoint({ GEOLIBRE_AI_PROXY_BASE_URL: "http://127.0.0.1:8798/v1/" }),
       { url: "http://127.0.0.1:8798/systemone", apiKey: null },
     );
   });
 
   it("falls back to calling TypeSafe with the user's own key", () => {
-    assert.deepEqual(resolveFastPathEndpoint({ JEV_API_KEY: "  abc  " }), {
+    assert.deepEqual(resolveSystemOneEndpoint({ JEV_API_KEY: "  abc  " }), {
       url: TYPESAFE_ENDPOINT,
       apiKey: "abc",
     });
   });
 
   it("is off when nothing is configured", () => {
-    assert.equal(resolveFastPathEndpoint({}), null);
-    assert.equal(resolveFastPathEndpoint({ JEV_API_KEY: "   " }), null);
+    assert.equal(resolveSystemOneEndpoint({}), null);
+    assert.equal(resolveSystemOneEndpoint({ JEV_API_KEY: "   " }), null);
   });
 });
 
@@ -430,7 +432,7 @@ describe("running a tool directly", () => {
 });
 
 describe("an endpoint that is not configured", () => {
-  beforeEach(resetFastPathAvailability);
+  beforeEach(resetSystemOneAvailability);
 
   const endpoint = { url: "https://ai.example.test/systemone", apiKey: null };
   const ask = (fetchImpl: FastPathFetch) =>
@@ -469,7 +471,7 @@ describe("an endpoint that is not configured", () => {
 });
 
 describe("names that the user may not control", () => {
-  beforeEach(resetFastPathAvailability);
+  beforeEach(resetSystemOneAvailability);
 
   it("flattens a layer name before it becomes part of a question", () => {
     // A name can arrive from a shared project or a remote service. Bounding it
@@ -510,7 +512,7 @@ describe("an explicit routing endpoint", () => {
     // token-injecting proxy; it is separate from the chat proxy because the two
     // need not be the same service.
     assert.deepEqual(
-      resolveFastPathEndpoint({
+      resolveSystemOneEndpoint({
         GEOLIBRE_FAST_PATH_URL: "http://localhost:5173/systemone",
         GEOLIBRE_AI_PROXY_BASE_URL: "https://ai.geolibre.app/v1",
         JEV_API_KEY: "personal-key",
@@ -523,7 +525,7 @@ describe("an explicit routing endpoint", () => {
     // The chat base gets `/systemone` appended and its `/v1` stripped; an
     // explicit endpoint is already the full URL and must be left alone.
     assert.deepEqual(
-      resolveFastPathEndpoint({ GEOLIBRE_FAST_PATH_URL: "https://x.test/systemone/" }),
+      resolveSystemOneEndpoint({ GEOLIBRE_FAST_PATH_URL: "https://x.test/systemone/" }),
       {
         url: "https://x.test/systemone",
         apiKey: null,
@@ -538,7 +540,7 @@ describe("an explicit routing endpoint", () => {
     const previous = Object.getOwnPropertyDescriptor(globalThis, "location");
     Object.defineProperty(globalThis, "location", { value: { origin }, configurable: true });
     try {
-      assert.deepEqual(resolveFastPathEndpoint({ GEOLIBRE_FAST_PATH_URL: "/systemone" }), {
+      assert.deepEqual(resolveSystemOneEndpoint({ GEOLIBRE_FAST_PATH_URL: "/systemone" }), {
         url: `${origin}/systemone`,
         apiKey: null,
       });
@@ -546,5 +548,68 @@ describe("an explicit routing endpoint", () => {
       if (previous) Object.defineProperty(globalThis, "location", previous);
       else delete (globalThis as { location?: unknown }).location;
     }
+  });
+});
+
+describe("endpoint transport security", () => {
+  /** Pretend the page is served from `origin` for the duration of `run`. */
+  function servedFrom<T>(origin: string | undefined, run: () => T): T {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "location");
+    Object.defineProperty(globalThis, "location", {
+      value: origin ? { origin } : undefined,
+      configurable: true,
+    });
+    try {
+      return run();
+    } finally {
+      if (original) Object.defineProperty(globalThis, "location", original);
+      else delete (globalThis as { location?: unknown }).location;
+    }
+  }
+
+  it("refuses plain HTTP to another origin", () => {
+    // Prompts, layer names and searches go over this, and the answer decides
+    // which tool runs — including remove_layer.
+    const endpoint = servedFrom("https://app.example", () =>
+      resolveSystemOneEndpoint({ GEOLIBRE_FAST_PATH_URL: "http://routing.internal/systemone" }),
+    );
+    assert.equal(endpoint, null);
+  });
+
+  it("allows loopback, which is the dev server's own proxy route", () => {
+    for (const url of [
+      "http://127.0.0.1:5173/systemone",
+      "http://localhost:5173/systemone",
+      "http://[::1]:5173/systemone",
+    ]) {
+      const endpoint = servedFrom("https://app.example", () =>
+        resolveSystemOneEndpoint({ GEOLIBRE_FAST_PATH_URL: url }),
+      );
+      assert.equal(endpoint?.url, url, url);
+    }
+  });
+
+  it("allows the page's own origin, however it is served", () => {
+    // A self-hosted deployment on plain HTTP resolves `/systemone` against
+    // itself. Refusing that protects nothing an attacker does not already have.
+    const endpoint = servedFrom("http://geolibre.lan", () =>
+      resolveSystemOneEndpoint({ GEOLIBRE_FAST_PATH_URL: "/systemone" }),
+    );
+    assert.equal(endpoint?.url, "http://geolibre.lan/systemone");
+  });
+
+  it("refuses a plain-HTTP managed proxy too", () => {
+    const endpoint = servedFrom("https://app.example", () =>
+      resolveSystemOneEndpoint({ GEOLIBRE_AI_PROXY_BASE_URL: "http://ai.internal/v1" }),
+    );
+    assert.equal(endpoint, null);
+  });
+
+  it("refuses a URL that is not a URL", () => {
+    assert.equal(resolveSystemOneEndpoint({ GEOLIBRE_FAST_PATH_URL: "not a url" }), null);
+  });
+
+  it("still reaches TypeSafe itself, which is HTTPS", () => {
+    assert.equal(resolveSystemOneEndpoint({ JEV_API_KEY: "k" })?.url, TYPESAFE_ENDPOINT);
   });
 });

@@ -190,7 +190,7 @@ the UI:
 | Ollama | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` |
 | Custom (OpenAI-compatible) | `OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_MODEL` |
 | Web search | `TAVILY_API_KEY` |
-| [Fast path](#fast-path-for-simple-commands-optional) | `JEV_API_KEY` |
+| [Fast path](#fast-path-for-simple-commands-optional) and [tool search](#finding-the-right-whitebox-tool-optional) | `JEV_API_KEY` |
 
 **Precedence:** a value you enter in **Settings → Environment Variables** always
 wins; the OS environment only fills in the gaps. In the AI settings, any field
@@ -293,7 +293,11 @@ changes appear in the transcript and are **undoable** like any other.
     ```
 
     Leaving the secret unset disables the route; the assistant keeps working
-    through the model as usual.
+    through the model as usual. A routing endpoint on **another origin must use
+    HTTPS** — a plain-HTTP one is refused, because the answer it returns decides
+    which tool the assistant runs. Loopback and an endpoint on the app's own
+    origin are the exceptions: there, HTTPS would protect nothing that an
+    attacker in a position to read the request does not already have.
 
 === "Local development"
 
@@ -321,6 +325,47 @@ Note that enabling the fast path means the text of a prompt and your **layer
 names** are sent to TypeSafe for routing. On a local-Ollama setup, where nothing
 otherwise leaves your machine, that is a real trade-off — which is why the fast
 path is off unless you configure it.
+
+## Finding the right Whitebox tool (optional)
+
+The same credential also changes how the assistant searches the **Whitebox
+catalog** — 775 raster, terrain, hydrology, LiDAR and imagery tools, far too
+many to put in front of a model at once.
+
+Without it, the assistant filters that catalog by substring, which only works
+when it already guesses the word the catalog uses. Ask for something in ordinary
+language and the filter finds nothing: no tool is called "grainy", so "get rid
+of the grainy speckle in a radar image" matches none of the four speckle filters
+the catalog actually ships.
+
+With a credential configured, the search is also answered by meaning. Two
+questions go to Jev — which part of the catalog, then which tool inside it — and
+the ranked answer is merged in front of the substring hits, which keep working
+unchanged. Measured over 20 raster requests:
+
+| The assistant searches for | Right tool found | Right tool listed first |
+| --- | --- | --- |
+| a keyword, substring only (before) | 19/20 | 8/20 |
+| a keyword, merged | 19/20 | **15/20** |
+| the request in plain words, substring only (before) | 0/20 | 0/20 |
+| the request in plain words, merged | **19/20** | **19/20** |
+
+The lookup adds about **400 ms** to a tool call the model is already waiting on,
+and like the fast path it can only add candidates: if TypeSafe is unreachable,
+slow or unconfigured, the search is exactly the substring filter it always was.
+
+This sends the assistant's search text to TypeSafe. Unlike the fast path it does
+**not** send your layer names — the questions are asked against the tool catalog,
+which is public data shipped with the app.
+
+!!! note "Tool summaries"
+
+    Both searches read each tool's `summary`, and 770 of the 775 in the bundled
+    catalog have one. The five that do not — `assign_projection_lidar`,
+    `assign_projection_raster`, `assign_projection_vector`, `reproject_lidar`
+    and `reproject_raster` — are in the tool taxonomy but not in the Whitebox
+    runtime catalog the summaries come from, so they are matched on their name
+    and category alone.
 
 ## Voice commands
 
@@ -462,9 +507,14 @@ load a CSV from a URL with pandas and summarize its columns
   the current view are sent to the model — not your feature data.
 - **What leaves your browser.** When you send a prompt, it (plus that scoped
   context) is sent to your chosen LLM provider using your own key. Don't enable
-  the assistant on sensitive data you can't share with that provider. With the
-  optional [fast path](#fast-path-for-simple-commands-optional) enabled, the
-  prompt and your layer names also go to TypeSafe for routing.
+  the assistant on sensitive data you can't share with that provider. A TypeSafe
+  credential adds a second destination for two things: the
+  [fast path](#fast-path-for-simple-commands-optional) sends the prompt and your
+  **layer names** there for routing, and
+  [tool search](#finding-the-right-whitebox-tool-optional) sends the text the
+  assistant is **searching the tool catalog for** (that one carries no layer
+  names). Both are off unless you configure them, and GeoLibre refuses a
+  routing endpoint that is plain HTTP on another origin.
 
 !!! note "Code-execution caveat"
     The JavaScript and Python fallbacks execute model-generated code in the app
