@@ -734,8 +734,7 @@ export class MapboxEngine implements MapEngine {
         const oldPlan = this.plans.get(layer.id);
         const sourceChanged =
           oldPlan &&
-          (JSON.stringify(oldPlan.additionalSources) !== JSON.stringify(plan.additionalSources) ||
-            oldPlan.source.type !== plan.source.type ||
+          (oldPlan.source.type !== plan.source.type ||
             (plan.source.type === "geojson" && oldPlan.source.type === "geojson"
               ? // Clustering is a source option mapbox-gl cannot change in
                 // place, so a renderer switch or new cluster radius/max zoom
@@ -743,8 +742,33 @@ export class MapboxEngine implements MapEngine {
                 clusterOptionsKey(oldPlan.source) !== clusterOptionsKey(plan.source)
               : JSON.stringify(oldPlan.source) !== JSON.stringify(plan.source)));
         if (sourceChanged) this.removeLayer(layer.id);
+        else if (oldPlan) {
+          // A companion source that went away or changed shape (the dedup
+          // label points appearing as a filter clears, say) is swapped on its
+          // own, with only the style layers that read it; the layer's other
+          // style layers stay as they are.
+          for (const [id, old] of Object.entries(oldPlan.additionalSources ?? {})) {
+            const next = plan.additionalSources?.[id];
+            if (next && sourcesShapeKey({ [id]: next }) === sourcesShapeKey({ [id]: old }))
+              continue;
+            for (const spec of oldPlan.layers)
+              if ("source" in spec && spec.source === id && map.getLayer(spec.id))
+                map.removeLayer(spec.id);
+            if (map.getSource(id)) map.removeSource(id);
+            this.clearError(id);
+          }
+        }
         for (const [id, source] of Object.entries(plan.additionalSources ?? {})) {
           if (!map.getSource(id)) map.addSource(id, source);
+          else if (
+            source.type === "geojson" &&
+            oldPlan?.additionalSources?.[id]?.type === "geojson" &&
+            (oldPlan.additionalSources[id] as mapboxgl.GeoJSONSourceSpecification).data !==
+              source.data
+          ) {
+            // A companion GeoJSON source (the dedup label points) got new data.
+            (map.getSource(id) as mapboxgl.GeoJSONSource).setData(source.data!);
+          }
         }
         if (!map.getSource(plan.sourceId)) map.addSource(plan.sourceId, plan.source);
         else if (
@@ -761,16 +785,29 @@ export class MapboxEngine implements MapEngine {
         for (const old of oldPlan?.layers ?? [])
           if (!wanted.has(old.id) && map.getLayer(old.id)) map.removeLayer(old.id);
         for (const spec of plan.layers) {
+          const oldSpec = oldPlan?.layers.find((s) => s.id === spec.id);
           const old = map.getLayer(spec.id);
-          if (old && old.type !== spec.type) map.removeLayer(spec.id);
+          // A style layer's type and source are fixed once added.
+          if (
+            old &&
+            (old.type !== spec.type ||
+              ("source" in spec && "source" in old && old.source !== spec.source))
+          )
+            map.removeLayer(spec.id);
           if (!map.getLayer(spec.id)) map.addLayer(spec);
-          else if (
-            JSON.stringify(oldPlan?.layers.find((s) => s.id === spec.id)) !== JSON.stringify(spec)
-          ) {
+          else if (JSON.stringify(oldSpec) !== JSON.stringify(spec)) {
             for (const [key, value] of Object.entries(spec.paint ?? {}))
               map.setPaintProperty(spec.id, key as keyof mapboxgl.AnyPaint, value);
             for (const [key, value] of Object.entries(spec.layout ?? {}))
               map.setLayoutProperty(spec.id, key as keyof mapboxgl.AnyLayout, value);
+            // A property the new plan dropped (a cleared label priority, say)
+            // goes back to its default rather than keeping its last value.
+            for (const key of Object.keys(oldSpec?.paint ?? {}))
+              if (!(key in (spec.paint ?? {})))
+                map.setPaintProperty(spec.id, key as keyof mapboxgl.AnyPaint, undefined);
+            for (const key of Object.keys(oldSpec?.layout ?? {}))
+              if (!(key in (spec.layout ?? {})))
+                map.setLayoutProperty(spec.id, key as keyof mapboxgl.AnyLayout, undefined);
             if ("filter" in spec) map.setFilter(spec.id, spec.filter ?? null);
             map.setLayerZoomRange(spec.id, spec.minzoom ?? 0, spec.maxzoom ?? 24);
           }
@@ -1856,4 +1893,18 @@ function featureIndex(features: Feature[], feature: Feature): number {
     featureIndexes.set(features, indexes);
   }
   return indexes.get(feature) ?? -1;
+}
+
+/**
+ * What a plan's companion sources look like apart from GeoJSON data, which
+ * the engine updates in place with `setData` instead of rebuilding the layer.
+ */
+function sourcesShapeKey(sources: Record<string, mapboxgl.SourceSpecification> | undefined) {
+  return JSON.stringify(
+    Object.entries(sources ?? {}).map(([id, source]) =>
+      source.type === "geojson"
+        ? [id, { ...source, data: typeof source.data === "string" ? source.data : "inline" }]
+        : [id, source],
+    ),
+  );
 }
