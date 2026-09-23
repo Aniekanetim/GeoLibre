@@ -36,6 +36,7 @@ import {
 } from "./map-engine";
 import {
   compileMapboxLayer,
+  isInternalMapboxLayer,
   isMapboxPluginLayer,
   DEFAULT_MAPBOX_TEXT_FONT,
   type MapboxLayerPlan,
@@ -48,6 +49,7 @@ import {
   styleLayerLabel,
 } from "./layer-labels";
 import { mapboxSourceId } from "./style-layer-ids";
+import { ensureGeneratedImageHandler } from "./generated-images";
 import { hasZoomDependentClusterFilter } from "./cluster-input";
 import { resolveTextFontFromStyleLayers } from "./text-font";
 import { getLayerBounds } from "./geojson-loader";
@@ -293,6 +295,9 @@ export class MapboxEngine implements MapEngine {
       unproject: (p) => map.unproject(p),
       redraw: () => map.triggerRepaint(),
     };
+    // Marker icons, fill patterns and line decorations are generated sprites
+    // the map asks for through `styleimagemissing`, as on MapLibre.
+    ensureGeneratedImageHandler(map as unknown as maplibregl.Map);
     map.on("style.load", this.styleLoaded);
     map.on("error", this.onError);
     map.on("sourcedata", this.onSourceData);
@@ -863,7 +868,13 @@ export class MapboxEngine implements MapEngine {
     const entries: Array<readonly [string, string]> = [];
     for (const layer of layers) {
       const prefix = `${mapboxSourceId(layer.id)}-`;
-      const planned = this.plans.get(layer.id)?.layers.map((spec) => spec.id) ?? [];
+      // Companion layers (masks, generator shapes, decorations, dedup labels)
+      // are not the layer's own, so no control lists them, as on MapLibre.
+      const planned =
+        this.plans
+          .get(layer.id)
+          ?.layers.filter((spec) => !isInternalMapboxLayer(spec))
+          .map((spec) => spec.id) ?? [];
       const native = Array.isArray(layer.metadata?.nativeLayerIds)
         ? layer.metadata.nativeLayerIds.filter((id): id is string => typeof id === "string")
         : [];
@@ -1415,13 +1426,16 @@ export class MapboxEngine implements MapEngine {
     if (!map?.isStyleLoaded()) return [];
     const ids = [...this.plans]
       .filter(([id]) => !layerId || id === layerId)
-      .flatMap(([id, p]) => p.layers.map((s) => ({ id: s.id, layerId: id })));
+      .flatMap(([id, p]) =>
+        p.layers.filter((s) => !isInternalMapboxLayer(s)).map((s) => ({ id: s.id, layerId: id })),
+      );
     const byId = new Map(ids.map((s) => [s.id, s.layerId]));
     const queryIds = ids.map((s) => s.id).filter((id) => map.getLayer(id));
     if (!queryIds.length) return [];
     const seen = new Set<string>();
     return map.queryRenderedFeatures(map.project(lngLat), { layers: queryIds }).flatMap((f) => {
-      const id = byId.get(f.layer?.id ?? "")!;
+      const id = byId.get(f.layer?.id ?? "");
+      if (!id) return [];
       const featureId = this.featureIdForLayer(id, f);
       const key = `${id}:${featureId ?? JSON.stringify(f.properties)}`;
       if (seen.has(key)) return [];
@@ -1441,15 +1455,22 @@ export class MapboxEngine implements MapEngine {
     const map = this.map;
     if (!map?.isStyleLoaded()) return null;
     const layer = this.layers.find((candidate) => candidate.id === layerId);
-    const queryIds = layer ? this.nativeLayerIds(layer) : [];
+    const queryIds = layer
+      ? (this.plans.get(layer.id)?.layers ?? [])
+          .filter((spec) => !isInternalMapboxLayer(spec) && this.map?.getLayer(spec.id))
+          .map((spec) => spec.id)
+      : [];
     if (!queryIds.length) return null;
-    const [feature] = map.queryRenderedFeatures(
-      [
-        [point.x - 4, point.y - 4],
-        [point.x + 4, point.y + 4],
-      ],
-      { layers: queryIds },
-    );
+    const queryable = new Set(queryIds);
+    const feature = map
+      .queryRenderedFeatures(
+        [
+          [point.x - 4, point.y - 4],
+          [point.x + 4, point.y + 4],
+        ],
+        { layers: queryIds },
+      )
+      .find((candidate) => queryable.has(candidate.layer?.id ?? ""));
     return feature ? this.featureIdForLayer(layerId, feature) : null;
   }
   /**
