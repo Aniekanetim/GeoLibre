@@ -90,11 +90,9 @@ function makeSdk() {
   const widgetClass = (kind: string) =>
     class {
       kind = kind;
-      unit: unknown;
       label: unknown;
       destroyed = false;
       constructor(public props: Record<string, unknown> = {}) {
-        this.unit = props.unit;
         this.label = props.label;
         widgets.push(this as never);
       }
@@ -314,7 +312,6 @@ function makeSdk() {
     widgets: {
       Zoom: widgetClass("Zoom"),
       Compass: widgetClass("Compass"),
-      ScaleBar: widgetClass("ScaleBar"),
       Fullscreen: widgetClass("Fullscreen"),
       Locate: widgetClass("Locate"),
       LayerList: widgetClass("LayerList"),
@@ -612,6 +609,96 @@ describe("ArcgisEngine camera conventions", () => {
     assert.deepEqual(call.target.center, [180, 85]);
     assert.equal(call.target.zoom, 10);
   });
+  it("keeps a flat view inside restricted bounds and the zoom range", async () => {
+    const { engine, rawView, goTo, fireViewEvent } = makeEngine();
+    await engine.settleView(engine.readView());
+    Object.assign(rawView, { zoom: 7, center: { longitude: 10, latitude: 20 } });
+    goTo.length = 0;
+    // 10 degrees by 10 degrees must fill the 800 x 600 view: zoom out no
+    // further than the level at which the box's height spans 600 pixels.
+    engine.applyMapPreferences({ ...PREFERENCES, restrictBounds: true, bounds: [0, 0, 10, 10] });
+    // No SDK lateral or zoom limit (with continuous zoom the SDK refuses the
+    // wheel steps that would cross one): the settled view eases back inside.
+    assert.equal(rawView.constraints.geometry, null);
+    assert.equal(rawView.constraints.minZoom, -1);
+    assert.equal(rawView.constraints.maxScale, 0);
+    const call = goTo.at(-1) as { target: { center: [number, number] } };
+    assert.deepEqual(call.target.center, [10, 10]);
+    // At the minimum, a wheel step out is dropped; one in is not.
+    rawView.zoom = 6.5;
+    const wheel = (deltaY: number) => {
+      let stopped = false;
+      fireViewEvent("mouse-wheel", { deltaY, stopPropagation: () => (stopped = true) });
+      return stopped;
+    };
+    assert.equal(wheel(100), false);
+    goTo.length = 0;
+    rawView.zoom = 3;
+    engine.applyMapPreferences({ ...PREFERENCES, restrictBounds: true, bounds: [0, 0, 10, 10] });
+    const minZoom = (goTo.at(-1) as { target: { zoom: number } }).target.zoom;
+    assert.ok(minZoom > 5 && minZoom < 6, String(minZoom));
+    rawView.zoom = minZoom;
+    assert.equal(wheel(100), true);
+    assert.equal(wheel(-100), false);
+    // And at the maximum, a step in is dropped.
+    engine.applyMapPreferences({ ...PREFERENCES, maxZoom: 12 });
+    rawView.zoom = 12;
+    assert.equal(wheel(-100), true);
+    assert.equal(wheel(100), false);
+  });
+  it("holds a scene inside the zoom range and bounds once it settles", async () => {
+    const { engine, rawView, goTo, fireWatchers } = makeSceneEngine();
+    await engine.settleView(engine.readView());
+    Object.assign(rawView, { zoom: 2, center: { longitude: 30, latitude: 40 } });
+    goTo.length = 0;
+    engine.applyMapPreferences({
+      ...PREFERENCES,
+      minZoom: 4,
+      maxZoom: 12,
+      restrictBounds: true,
+      bounds: [-10, -10, 10, 10],
+    });
+    // On a globe the zoom range is also an altitude range, lower zoom higher.
+    const altitude = (rawView.constraints as { altitude: { min: number; max: number } }).altitude;
+    assert.ok(altitude.max > altitude.min && altitude.min > 0);
+    const call = goTo.at(-1) as { target: { center: [number, number]; zoom: number } };
+    assert.deepEqual(call.target.center, [10, 10]);
+    // Zoom 4, raised until the 20 degree box fills the view.
+    assert.ok(call.target.zoom > 4.5 && call.target.zoom < 5, String(call.target.zoom));
+    // Inside the range and bounds, nothing moves, nor does a centre a hair
+    // past the edge the correction moved it to.
+    Object.assign(rawView, { zoom: 6, center: { longitude: 10.0000001, latitude: 2 } });
+    goTo.length = 0;
+    fireWatchers();
+    assert.equal(goTo.length, 0);
+  });
+  it("reapplies the bounds' minimum zoom once the view has its size", async () => {
+    const { engine, rawView, goTo, fireWatchers } = makeEngine();
+    await engine.settleView(engine.readView());
+    Object.assign(rawView, { width: 0, height: 0, zoom: 3, center: { longitude: 5, latitude: 5 } });
+    goTo.length = 0;
+    engine.applyMapPreferences({ ...PREFERENCES, restrictBounds: true, bounds: [0, 0, 10, 10] });
+    // Unsized, the bounds cannot raise the minimum.
+    assert.equal(goTo.length, 0);
+    Object.assign(rawView, { width: 800, height: 600 });
+    fireWatchers();
+    assert.ok((goTo.at(-1) as { target: { zoom: number } }).target.zoom > 5);
+  });
+  it("does not correct the default camera before the stored one is placed", async () => {
+    const { engine, rawView, goTo } = makeEngine();
+    Object.assign(rawView, { zoom: 2, center: { longitude: 30, latitude: 40 } });
+    goTo.length = 0;
+    engine.applyMapPreferences({
+      ...PREFERENCES,
+      minZoom: 4,
+      restrictBounds: true,
+      bounds: [0, 0, 10, 10],
+    });
+    // The default camera is outside the limits, but settleView owns the move.
+    assert.equal(goTo.length, 0);
+    await engine.settleView({ center: [5, 5], zoom: 7, bearing: 0, pitch: 0 });
+    assert.deepEqual((goTo[0] as { target: { center: [number, number] } }).target.center, [5, 5]);
+  });
   it("converts GeoJSON geometry to SDK geometry JSON", () => {
     assert.deepEqual(geojsonToArcgisGeometry({ type: "Point", coordinates: [1, 2] }), {
       type: "point",
@@ -690,6 +777,7 @@ describe("ArcgisEngine controls", () => {
   });
 
   it("replaces the SDK's default UI with the Controls menu's default set", () => {
+    using _document = withDocument();
     const { engine, widgets, uiAdds, rawView } = makeEngine();
     assert.deepEqual(rawView.ui.components, []);
     // Fullscreen, compass and scale are on by default; navigation (zoom) and
@@ -697,14 +785,16 @@ describe("ArcgisEngine controls", () => {
     // equivalent and are skipped. Attribution is the view's own rendering
     // (`attributionVisible`), not a widget, and can never be turned off.
     assert.equal(rawView.attributionVisible, true);
+    // The scale bar is the 2D map's own control, not an SDK widget.
     assert.deepEqual(
       widgets.map((w) => w.kind),
-      ["Fullscreen", "Compass", "ScaleBar"],
+      ["Fullscreen", "Compass"],
     );
     assert.deepEqual(
       uiAdds.map((entry) => entry.position),
       ["top-right", "top-right", "bottom-left"],
     );
+    assert.match((uiAdds[2].component as { className: string }).className, /maplibregl-ctrl-scale/);
     assert.equal(engine.setBuiltInControlVisible("navigation", true), true);
     assert.equal(widgets.at(-1)?.kind, "Zoom");
     assert.equal(engine.setBuiltInControlVisible("attribution", false), false);
@@ -719,6 +809,7 @@ describe("ArcgisEngine controls", () => {
     assert.equal(engine.capabilities.domControls, true);
   });
   it("mounts moved controls in the corners an earlier view reported", () => {
+    using _document = withDocument();
     const moves: [string, string][] = [];
     const { engine, uiAdds } = makeEngine({
       controlPositions: { compass: "bottom-left" },
@@ -733,22 +824,41 @@ describe("ArcgisEngine controls", () => {
     assert.deepEqual(moves, [["scale", "top-left"]]);
   });
   it("forwards the scale unit and compass label to the widgets", () => {
-    const { engine, widgets } = makeEngine();
-    engine.applyMapPreferences({
-      minZoom: 0,
-      maxZoom: 24,
-      maxPitch: 85,
-      renderWorldCopies: true,
-      restrictBounds: false,
-      bounds: [-180, -85, 180, 85],
-      projection: "mercator",
-      scaleUnit: "imperial",
-    } as MapPreferences);
-    assert.equal(widgets.find((w) => w.kind === "ScaleBar")?.unit, "non-metric");
+    using _document = withDocument();
+    const { engine, widgets, uiAdds } = makeEngine();
+    const scale = uiAdds[2].component as { textContent: string };
+    const apply = (scaleUnit: MapPreferences["scaleUnit"]) =>
+      engine.applyMapPreferences({
+        minZoom: 0,
+        maxZoom: 24,
+        maxPitch: 85,
+        renderWorldCopies: true,
+        restrictBounds: false,
+        bounds: [-180, -85, 180, 85],
+        projection: "mercator",
+        scaleUnit,
+      } as MapPreferences);
+    apply("imperial");
+    assert.match(scale.textContent, / mi$/);
+    // The SDK's own scale bar had no nautical miles.
+    apply("nautical");
+    assert.match(scale.textContent, / nmi$/);
     engine.setCompassLabel("Reset");
     assert.equal(widgets.find((w) => w.kind === "Compass")?.label, "Reset");
   });
 });
+
+/** Install a DOM for the controls that build their own elements. */
+function withDocument(): Disposable {
+  const { document } = parseHTML("<html><body></body></html>");
+  const previous = globalThis.document;
+  (globalThis as { document: unknown }).document = document;
+  return {
+    [Symbol.dispose]() {
+      (globalThis as { document: unknown }).document = previous;
+    },
+  };
+}
 
 describe("ArcgisEngine layer sync", () => {
   beforeEach(() => {
@@ -1442,7 +1552,7 @@ describe("ArcgisEngine 3D scenes", () => {
     assert.deepEqual(polygon?.props.elevationInfo, { mode: "relative-to-ground", offset: 3 });
   });
 
-  it("hosts the globe toggle only with a projection callback, and no scale bar in 3D", () => {
+  it("hosts the globe toggle only with a projection callback, and the scale bar in 3D", () => {
     const { document } = parseHTML("<html><body></body></html>");
     const previous = globalThis.document;
     (globalThis as { document: unknown }).document = document;
@@ -1455,7 +1565,14 @@ describe("ArcgisEngine 3D scenes", () => {
         widgets.map((w) => w.kind),
         ["Fullscreen", "Compass"],
       );
-      assert.equal(engine.setBuiltInControlVisible("scale", true), false);
+      // The 2D map's scale bar measures a scene at its centre too.
+      assert.ok(
+        uiAdds.some((entry) =>
+          /maplibregl-ctrl-scale/.test(String((entry.component as HTMLElement).className)),
+        ),
+      );
+      assert.equal(engine.setBuiltInControlVisible("scale", false), true);
+      assert.equal(engine.setBuiltInControlVisible("scale", true), true);
       const globe = uiAdds.find(
         (entry) => entry.component instanceof document.defaultView!.HTMLElement,
       )?.component as HTMLElement | undefined;

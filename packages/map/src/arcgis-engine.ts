@@ -5,6 +5,8 @@ import { createArcgisArchiveLayer } from "./arcgis-tile-archives";
 import { createArcgisTemplateTileLayer } from "./arcgis-template-tiles";
 import { attachArcgisSprite } from "./arcgis-sprite";
 import { createArcgisCogLayer, loadCogTiler } from "./arcgis-cog-imagery";
+import { createArcgisScaleBar, type ArcgisScaleBar } from "./arcgis-scale-bar";
+import { boundsFillMinZoom, normalizeMapBounds } from "./map-bounds";
 import { cachingCogTiler, cogSourceUrl } from "./cog-imagery";
 import { SEARCH_HIGHLIGHT_COLOR } from "./map-engine";
 import { renderFillPatternCanvas } from "./fill-patterns";
@@ -420,6 +422,28 @@ function viewZoom(view: ArcgisView): number {
 }
 
 /**
+ * The view's scale at a zoom level. The SDK's levels follow the basemap's
+ * tiling scheme (a 512 px vector basemap's level 6 is a 256 px scheme's level
+ * 7), so the scale is taken from the view's own zoom-to-scale ratio; a view
+ * with no levels (the Blank basemap) uses the standard scheme `viewZoom` reads.
+ */
+function scaleForZoom(view: ArcgisView, zoom: number): number {
+  return view.zoom >= 0 && view.scale > 0
+    ? view.scale * 2 ** (view.zoom - zoom)
+    : zoomToScale(zoom);
+}
+
+/**
+ * Which zoom-level scheme the view is in, as the power of two its levels are
+ * offset by from the standard scheme; changes only when the basemap does.
+ */
+function levelScheme(view: ArcgisView): number {
+  return view.zoom >= 0 && view.scale > 0
+    ? Math.round(Math.log2(scaleForZoom(view, 0) / zoomToScale(0)))
+    : 0;
+}
+
+/**
  * A rejected `goTo` is worth a warning, not a render error: the SDK rejects
  * when a later move interrupts this one (routine) but also when a target is
  * malformed, and the second must not vanish silently.
@@ -487,6 +511,8 @@ export class ArcgisEngine implements MapEngine {
    * the layer's features, so identify skips them.
    */
   private companions = new WeakSet<ArcgisLayer>();
+  /** Whether {@link settleView} has placed the stored camera. */
+  private placed = false;
   private errors = new Map<string, string>();
   private preferences: MapPreferences | null = null;
   private basemapPlan: ArcgisBasemapPlan | null = null;
@@ -647,12 +673,34 @@ export class ArcgisEngine implements MapEngine {
         if (CAMERA_KEYS.has((event as { key?: string }).key ?? "")) this.storyMove = false;
       }),
     );
+    // A string, so the camera's own changes (the scheme reads the zoom and
+    // scale) re-evaluate the getter without re-running the callback.
+    this.handles.add(
+      sdk.reactiveUtils.watch(
+        () => `${view.ready}|${view.width}|${view.height}|${levelScheme(view)}`,
+        () => this.applyNavigationLimits(),
+      ),
+    );
+    // The project's zoom range on a flat view (see `applyNavigationLimits`):
+    // a wheel step past a limit the view is at is dropped, and one that
+    // overshoots a limit is eased back once the view settles.
+    this.handles.add(
+      view.on("mouse-wheel", (event) => {
+        if (view.type !== "2d") return;
+        const deltaY = event.deltaY ?? 0;
+        const zoom = viewZoom(view);
+        const { minZoom, maxZoom } = this.zoomRange();
+        if ((deltaY > 0 && zoom <= minZoom + 0.01) || (deltaY < 0 && zoom >= maxZoom - 0.01))
+          event.stopPropagation();
+      }),
+    );
     // Expressions baked at one zoom are re-evaluated when the integer zoom
     // changes, the way MapLibre would evaluate `["zoom"]` live.
     this.zoomWatch = sdk.reactiveUtils.when(
       () => view.stationary,
       () => {
         if (!this.view) return;
+        this.constrainSettledView();
         const zoom = Math.round(viewZoom(this.view));
         if (zoom === this.compiledZoom) return;
         this.compiledZoom = zoom;
@@ -831,6 +879,11 @@ export class ArcgisEngine implements MapEngine {
       );
     } catch (error) {
       reportGoToFailure(error);
+    } finally {
+      // The stored camera has landed; from here a settle outside the limits
+      // is corrected (it may itself be outside the bounds).
+      this.placed = true;
+      this.constrainSettledView();
     }
   }
   easeToView(view: MapViewState): void {
@@ -855,8 +908,7 @@ export class ArcgisEngine implements MapEngine {
   } {
     const p = this.preferences;
     const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
-    const minZoom = p ? clamp(p.minZoom, 0, 24) : 0;
-    const maxZoom = p ? Math.max(minZoom, clamp(p.maxZoom, 0, 24)) : 24;
+    const { minZoom, maxZoom } = this.zoomRange();
     return {
       center: [
         !p || p.renderWorldCopies ? view.center[0] : clamp(view.center[0], -180, 180),
@@ -1079,36 +1131,122 @@ export class ArcgisEngine implements MapEngine {
   }
   applyMapPreferences(p: MapPreferences): void {
     this.preferences = p;
-    const view = this.view;
-    if (!view) return;
-    const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+    if (!this.view) return;
     this.setTerrainEnabled(p.terrainEnabled);
+    (this.builtInControls.get("scale") as ArcgisScaleBar | undefined)?.setUnit(p.scaleUnit);
+    this.applyNavigationLimits();
+  }
+  /**
+   * Hold the view to the project's zoom range, pitch limit and bounds. Rerun
+   * when the view is ready, resized or given another zoom-level scheme (a
+   * basemap swap): the bounds' minimum zoom depends on the view's size, and a
+   * flat view's limits are scales in its own scheme.
+   */
+  private applyNavigationLimits(): void {
+    const p = this.preferences;
+    const view = this.view;
+    if (!p || !view) return;
+    const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+    const { minZoom, maxZoom } = this.zoomRange();
     if (view.type === "3d") {
-      // A SceneView's constraints are about the camera (tilt, altitude), not
-      // zoom levels or an extent; `constrainView` still clamps the zoom the
-      // app asks for, and the project's pitch limit becomes the tilt limit.
+      // A SceneView's constraints are about the camera: the pitch limit
+      // becomes the tilt limit and, on a globe, the zoom range an altitude
+      // range. The bounds (and a local scene's zoom) are held by
+      // `constrainSettledView` once the camera settles.
       if (view.constraints.tilt) view.constraints.tilt.max = clamp(p.maxPitch, 0, 85);
+      // An unsized view has no diagonal to measure yet; the size watch
+      // applies the range once it has one.
+      if (view.viewingMode === "global" && view.width > 0 && view.height > 0)
+        view.constraints.altitude = {
+          min: this.altitudeForZoom(view, maxZoom),
+          max: this.altitudeForZoom(view, minZoom),
+        };
+      this.constrainSettledView();
       return;
     }
-    const minZoom = clamp(p.minZoom, 0, 24);
-    const maxZoom = Math.max(minZoom, clamp(p.maxZoom, 0, 24));
     view.constraints = {
-      minZoom,
-      maxZoom,
+      // No SDK zoom limits: with zoom snapping off (MapLibre's continuous
+      // zoom), the SDK refuses a wheel step that would cross a limit instead
+      // of stopping at it, which can stop the wheel well short of the limit
+      // or at the current zoom. The zoom range is held by the wheel guard in
+      // the constructor and by `constrainSettledView`.
+      minZoom: -1,
+      maxZoom: -1,
+      minScale: 0,
+      maxScale: 0,
       rotationEnabled: true,
       snapToZoom: false,
-      geometry: p.restrictBounds
-        ? new this.sdk.Extent({
-            xmin: p.bounds[0],
-            ymin: p.bounds[1],
-            xmax: p.bounds[2],
-            ymax: p.bounds[3],
-            spatialReference: { wkid: 4326 },
-          })
-        : null,
+      // The bounds are held by `constrainSettledView`, not the SDK's lateral
+      // `geometry`: with a zoom limit as well, the SDK refuses to zoom out by
+      // wheel at all. The SDK always wraps around the antimeridian, so
+      // `renderWorldCopies` is only honoured for the views the app applies.
+      geometry: null,
     };
-    const scale = this.builtInControls.get("scale");
-    if (scale) scale.unit = scaleBarUnit(p.scaleUnit);
+    this.constrainSettledView();
+  }
+  /**
+   * The project's zoom range in MapLibre levels. With restricted bounds the
+   * minimum rises until the bounds fill the view, as on the 2D map.
+   */
+  private zoomRange(): { minZoom: number; maxZoom: number } {
+    const p = this.preferences;
+    const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+    if (!p) return { minZoom: 0, maxZoom: 24 };
+    const requested = clamp(p.minZoom, 0, 24);
+    const view = this.view;
+    const minZoom =
+      view && view.width > 0 && view.height > 0
+        ? boundsFillMinZoom(p, view.width, view.height, requested)
+        : requested;
+    return { minZoom, maxZoom: Math.max(minZoom, clamp(p.maxZoom, 0, 24)) };
+  }
+  /**
+   * The camera height a nadir `SceneView` has at a MapLibre zoom level: the
+   * height at which the view's diagonal field of view spans the zoom's
+   * ground resolution (the SDK's scale is measured over the diagonal).
+   */
+  private altitudeForZoom(view: ArcgisSceneView, zoom: number): number {
+    const metresPerPixel = (scaleForZoom(view, zoom) * 0.0254) / 96;
+    const diagonal = Math.hypot(view.width || 1, view.height || 1);
+    const fov = ((view.camera?.fov ?? 55) * Math.PI) / 180;
+    return (metresPerPixel * diagonal) / (2 * Math.tan(fov / 2));
+  }
+  /**
+   * Bring a settled view back inside the project's zoom range and bounds,
+   * which the SDK's constraints cannot hold: a scene's altitude limit only
+   * approximates the zoom range, and neither view limits the extent (see
+   * `applyNavigationLimits`). Like the SDK's own lateral limit, it holds the
+   * centre inside the bounds, where MapLibre keeps the whole viewport.
+   */
+  private constrainSettledView(): void {
+    const view = this.view;
+    const p = this.preferences;
+    // Not before the stored camera is placed: the view's default camera would
+    // start a correction that interrupts `settleView`'s own move.
+    if (!view || !p || !this.placed || !view.ready || !view.stationary || this.storyMove) return;
+    const { minZoom, maxZoom } = this.zoomRange();
+    const zoom = viewZoom(view);
+    const bounds = p.restrictBounds ? normalizeMapBounds(p.bounds) : null;
+    const lng = view.center.longitude ?? 0;
+    const lat = view.center.latitude ?? 0;
+    const center: [number, number] = bounds
+      ? [
+          Math.min(bounds[2], Math.max(bounds[0], lng)),
+          Math.min(bounds[3], Math.max(bounds[1], lat)),
+        ]
+      : [lng, lat];
+    // A little slack, so the SDK's own rounding never starts a correction.
+    const targetZoom = zoom < minZoom - 0.05 ? minZoom : zoom > maxZoom + 0.05 ? maxZoom : null;
+    // The SDK's projection round trip can leave a settled centre a hair past
+    // the edge it was moved to; that must not start another correction.
+    const moved = Math.abs(center[0] - lng) > 1e-6 || Math.abs(center[1] - lat) > 1e-6;
+    if (targetZoom === null && !moved) return;
+    void view
+      .goTo(
+        { center, ...(targetZoom === null ? {} : this.zoomTarget(targetZoom)) },
+        { duration: 300 },
+      )
+      .catch(reportGoToFailure);
   }
 
   // ------------------------------------------------------------------- layers
@@ -2422,16 +2560,16 @@ export class ArcgisEngine implements MapEngine {
         // Only the canvas can rebuild the view in the other projection.
         if (!this.options.onProjectionToggle || typeof document === "undefined") return null;
         return createGlobeToggle(this.readProjection(), this.options.onProjectionToggle);
-      case "scale": {
-        // The SDK's scale bar measures a MapView only; a tilted or globe
-        // scene has no single scale to show.
-        if (view.type === "3d") return null;
-        return new widgets.ScaleBar({
+      case "scale":
+        // The 2D map's scale bar: it knows nautical miles and other bodies'
+        // radii, and it measures at the centre of a scene too.
+        if (typeof document === "undefined") return null;
+        return createArcgisScaleBar(
+          this.sdk,
           view,
-          unit: scaleBarUnit(this.preferences?.scaleUnit),
-          style: "ruler",
-        });
-      }
+          () => this.getRenderSurface(),
+          this.preferences?.scaleUnit ?? "metric",
+        );
       default:
         return null;
     }
@@ -2468,7 +2606,6 @@ export class ArcgisEngine implements MapEngine {
     }
     if (id === "globe" && !this.options.onProjectionToggle) return false;
     if (id === "layer-control" && !this.options.onLayerVisibilityChange) return false;
-    if (id === "scale" && this.view.type === "3d") return false;
     this.controlVisibility[id] = visible;
     if (visible) this.mountBuiltInControl(id);
     else this.unmountBuiltInControl(id);
@@ -2667,9 +2804,4 @@ function geojsonCompileKey(layer: GeoLibreLayer): string {
       : undefined;
   // The blend mode is applied in place, like opacity.
   return JSON.stringify({ ...rest, labelOpacity, style: { ...rest.style, blendMode: undefined } });
-}
-
-/** The SDK's ScaleBar knows metric and "non-metric" (feet and miles). */
-function scaleBarUnit(unit: MapPreferences["scaleUnit"] | undefined): string {
-  return unit === "imperial" ? "non-metric" : "metric";
 }
