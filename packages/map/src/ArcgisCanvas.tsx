@@ -10,6 +10,11 @@ import type { BuiltInMapControl, MapEngine } from "./map-engine";
 import type { MapDiagnosticEvent } from "./map-diagnostic";
 import { attachFeatureSelection, type FeatureSelectionState } from "./map-feature-selection";
 import { arcgisFeatureSelectionMap } from "./arcgis-feature-selection";
+import { createArcgisIdentify } from "./arcgis-identify";
+import { consumePendingIdentifyRestore } from "./map-identify-lifecycle";
+import { selectionFitKey } from "./map-selection";
+import { DEFAULT_IDENTIFY_ALL_LABELS, type MapCanvasIdentifyAllLabels } from "./identify-all-popup";
+import type { MapCanvasRasterIdentify } from "./MapCanvas";
 import type * as maplibregl from "maplibre-gl";
 import { CogDemError } from "./cog-dem-source";
 import {
@@ -49,6 +54,10 @@ export interface ArcgisCanvasProps {
   messages?: Partial<ArcgisEngineMessages>;
   /** Whether the pointer readout may look elevations up remotely (consent). */
   canUseRemoteElevation?: () => boolean;
+  /** Translated headings for the grouped "Identify visible layers" popup. */
+  identifyAllLabels?: MapCanvasIdentifyAllLabels;
+  /** Reads a COG or NetCDF pixel for "Identify visible layers". */
+  identifyRasterLayerAt?: MapCanvasRasterIdentify;
 }
 
 /**
@@ -79,6 +88,8 @@ export function ArcgisCanvas({
   onMapDiagnosticEvent,
   messages,
   canUseRemoteElevation,
+  identifyAllLabels = DEFAULT_IDENTIFY_ALL_LABELS,
+  identifyRasterLayerAt,
 }: ArcgisCanvasProps) {
   const container = useRef<HTMLDivElement>(null);
   // Views replaced by a 2D/3D switch, kept on screen until the new view draws.
@@ -104,6 +115,10 @@ export function ArcgisCanvas({
   messagesRef.current = messages;
   const canUseRemoteElevationRef = useRef(canUseRemoteElevation);
   canUseRemoteElevationRef.current = canUseRemoteElevation;
+  const identifyAllLabelsRef = useRef(identifyAllLabels);
+  identifyAllLabelsRef.current = identifyAllLabels;
+  const identifyRasterLayerAtRef = useRef(identifyRasterLayerAt);
+  identifyRasterLayerAtRef.current = identifyRasterLayerAt;
   // The live engine, for effects that update it in place.
   const liveEngine = useRef<ArcgisEngine | null>(null);
   useEffect(() => {
@@ -282,6 +297,50 @@ export function ArcgisCanvas({
           popupDispose?.();
           popupDispose = null;
         };
+        // Identify, as on the other maps: popup templates, WMS/pixel/DuckDB
+        // reads and "Identify visible layers" (arcgis-identify.ts). The popup
+        // is a box anchored above the clicked point.
+        const identify = createArcgisIdentify({
+          identifyFeaturesAt: (point, layerId) => current.identifyFeaturesAt(point, layerId),
+          toLngLat: (point) => {
+            const at = mapView.toMap(point);
+            return at ? [at.longitude, at.latitude] : null;
+          },
+          zoom: () => current.readView().zoom,
+          showPopup: (lngLat, content, maxWidth, onClose) => {
+            removePopup();
+            if (cancelled || !mapView.container) return;
+            const box = document.createElement("div");
+            box.className = "geolibre-identify-popup geolibre-arcgis-popup";
+            Object.assign(box.style, {
+              maxWidth,
+              maxHeight: "60%",
+              overflow: "auto",
+              padding: "10px",
+              borderRadius: "6px",
+              background: "hsl(var(--popover))",
+              color: "hsl(var(--popover-foreground))",
+              border: "1px solid hsl(var(--border))",
+              boxShadow: "0 2px 12px #0005",
+            });
+            const close = document.createElement("button");
+            close.type = "button";
+            close.className =
+              "geolibre-arcgis-popup-close absolute end-1 top-1 rounded px-1 text-lg hover:bg-muted focus-visible:outline";
+            close.setAttribute("aria-label", closeLabelRef.current);
+            close.title = closeLabelRef.current;
+            close.textContent = "×";
+            close.onclick = () => {
+              removePopup();
+              onClose?.();
+            };
+            box.append(close, content);
+            popupDispose = anchorPopup(sdk, mapView, box, lngLat);
+          },
+          removePopup,
+          labels: () => identifyAllLabelsRef.current,
+          identifyRaster: () => identifyRasterLayerAtRef.current,
+        });
         const setIdentifyCursor = (active: boolean) => {
           const cursor = active ? "crosshair" : "";
           element.style.cursor = cursor;
@@ -403,8 +462,16 @@ export function ArcgisCanvas({
                 next.selectedLayerId && ids !== null && (Array.isArray(ids) ? ids.length : true)
                   ? JSON.stringify([next.selectedLayerId, Array.isArray(ids) ? ids : [ids]])
                   : null;
+              // An Identify popup closing gives the earlier selection back;
+              // that restore is not a new selection to frame (read-once marker,
+              // as on the other canvases; see map-identify-lifecycle.ts).
+              const restored = consumePendingIdentifyRestore(selectionFitKey(next));
               const fit = Boolean(
-                next.ui.zoomToSelectedFeature && key && key !== selectionKey && previous,
+                next.ui.zoomToSelectedFeature &&
+                key &&
+                key !== selectionKey &&
+                previous &&
+                !restored,
               );
               selectionKey = key;
               current.highlightFeature(
@@ -428,7 +495,11 @@ export function ArcgisCanvas({
               if (!viewId) next.setPointerElevation(null);
             }
             if (!viewId && (!previous || next.identifyLayerId !== previous.identifyLayerId)) {
-              if (previous) removePopup();
+              // A read still in flight for the old target must not reopen a popup.
+              if (previous) {
+                identify.dispose();
+                removePopup();
+              }
               // Identify and a selection gesture both own map clicks; the
               // newer one wins, as on the other renderers.
               if (next.identifyLayerId) featureSelection.cancel.current?.();
@@ -548,52 +619,7 @@ export function ArcgisCanvas({
         handles.push(
           mapView.on("click", (event) => {
             if (viewId || featureSelection.active.current) return;
-            const next = useAppStore.getState();
-            if (!next.identifyLayerId) return;
-            const layerId = next.layers.some((l) => l.id === next.identifyLayerId)
-              ? next.identifyLayerId
-              : undefined;
-            void current
-              .identifyFeaturesAt({ x: event.x, y: event.y }, layerId)
-              .catch(() => [] as Awaited<ReturnType<typeof current.identifyFeaturesAt>>)
-              .then((matches) => {
-                if (cancelled) return;
-                const match = matches[0];
-                removePopup();
-                const latest = useAppStore.getState();
-                if (!match) {
-                  latest.selectFeature(null);
-                  return;
-                }
-                latest.selectLayer(match.layerId);
-                latest.selectFeature(match.featureId);
-                const point = mapView.toMap({ x: event.x, y: event.y });
-                if (!point || !mapView.container) return;
-                const content = document.createElement("div");
-                content.className = "geolibre-arcgis-popup";
-                const title = document.createElement("strong");
-                title.textContent = latest.layers.find((l) => l.id === match.layerId)?.name ?? "";
-                content.append(title);
-                for (const [key, value] of Object.entries(match.properties)) {
-                  const row = document.createElement("div");
-                  row.textContent = `${key}: ${
-                    typeof value === "object" ? JSON.stringify(value) : String(value)
-                  }`;
-                  content.append(row);
-                }
-                const close = document.createElement("button");
-                close.type = "button";
-                close.className = "geolibre-arcgis-popup-close";
-                close.setAttribute("aria-label", closeLabelRef.current);
-                close.title = closeLabelRef.current;
-                close.textContent = "×";
-                close.onclick = removePopup;
-                content.prepend(close);
-                popupDispose = anchorPopup(sdk, mapView, content, [
-                  point.longitude,
-                  point.latitude,
-                ]);
-              });
+            identify.click({ x: event.x, y: event.y });
           }),
         );
         void mapView
@@ -663,6 +689,7 @@ export function ArcgisCanvas({
         theme.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
         cleanup = () => {
           detachSelection();
+          identify.dispose();
           pointerElevation?.dispose();
           unsubscribe();
           for (const handle of handles) handle.remove();

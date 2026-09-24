@@ -10,7 +10,7 @@ import { renderFillPatternCanvas } from "./fill-patterns";
 import { registerCogDemSource, type CogDemSourceRegistration } from "./cog-dem-source";
 import { createCogElevationLayer } from "./arcgis-cog-terrain";
 import type * as maplibregl from "maplibre-gl";
-import type { FeatureCollection, Geometry, Point, Polygon, Position } from "geojson";
+import type { Feature, FeatureCollection, Geometry, Point, Polygon, Position } from "geojson";
 import {
   compileLayerFilters,
   portableWmsTileUrl,
@@ -240,6 +240,9 @@ const CAMERA_KEYS = new Set([
   "p",
   "P",
 ]);
+
+/** Pages of a service's features `getLayerGeoJson` reads before stopping. */
+const SERVICE_GEOJSON_MAX_PAGES = 50;
 
 /** Pixel radius the synchronous identify accepts around points and lines. */
 const HIT_TOLERANCE_PX = 6;
@@ -500,6 +503,12 @@ export class ArcgisEngine implements MapEngine {
   private storyMoveLapse: ReturnType<typeof setTimeout> | undefined;
   /** Integer zoom the zoom-dependent plans were compiled at. */
   private compiledZoom: number;
+  /**
+   * Geometries of service features the hit test has returned, keyed by
+   * `layerId:featureId`: a service layer's features never live in the store,
+   * so this is what a selection of one is highlighted from. Bounded.
+   */
+  private serviceGeometries = new Map<string, Geometry>();
   /** Results of the latest hit test, served by the synchronous identify. */
   private lastHit: { lngLat: [number, number]; features: IdentifiedFeature[] } | null = null;
   private zoomWatch: ArcgisHandle | null = null;
@@ -1335,18 +1344,30 @@ export class ArcgisEngine implements MapEngine {
       case "vector-tile":
         // `fullExtent` is read-only on a VectorTileLayer (it comes from the style).
         return [new layers.VectorTileLayer({ ...common, style: plan.style })];
-      case "feature-service":
-        return [
-          new layers.FeatureLayer({
-            ...common,
-            url: plan.url,
-            popupEnabled: false,
-            outFields: ["*"],
-            ...(plan.definitionExpression
-              ? { definitionExpression: plan.definitionExpression }
-              : {}),
-          }),
-        ];
+      case "feature-service": {
+        const native = new layers.FeatureLayer({
+          ...common,
+          url: plan.url,
+          popupEnabled: false,
+          outFields: ["*"],
+          ...(plan.definitionExpression ? { definitionExpression: plan.definitionExpression } : {}),
+        });
+        // The service's geometry type is known only once it has loaded.
+        const symbols = plan.symbols;
+        if (symbols)
+          void native
+            .when()
+            .then(() => {
+              // A restyle or removal may have replaced the layer meanwhile.
+              if (native.destroyed) return;
+              const type = (native as { geometryType?: string }).geometryType;
+              const kind = type === "multipoint" ? "point" : type;
+              if (kind === "point" || kind === "polyline" || kind === "polygon")
+                native.renderer = { type: "simple", symbol: symbols[kind] };
+            })
+            .catch(() => {});
+        return [native];
+      }
       case "tile-service":
         return [new layers.TileLayer({ ...common, url: plan.url })];
       case "map-image":
@@ -1414,12 +1435,79 @@ export class ArcgisEngine implements MapEngine {
     this.natives.delete(id);
     this.errors.delete(`layer:${id}`);
     this.errors.delete(`filter:${id}`);
+    for (const key of [...this.serviceGeometries.keys()])
+      if (key.startsWith(`${id}:`)) this.serviceGeometries.delete(key);
   }
   waitAndSyncLayers(layers: GeoLibreLayer[]): void {
     this.syncLayers(layers);
   }
   async getLayerGeoJson(id: string): Promise<FeatureCollection | null> {
-    return this.layers.find((l) => l.id === id)?.geojson ?? null;
+    const layer = this.layers.find((l) => l.id === id);
+    if (layer?.geojson) return layer.geojson;
+    // A service layer's features live on the server: page through them the
+    // way the service allows (its maxRecordCount per request), up to a cap.
+    const entry = this.natives.get(id);
+    const native = entry?.plan.kind === "feature-service" ? entry.layers[0] : undefined;
+    if (!native?.queryFeatures) return null;
+    const graphics: ArcgisGraphic[] = [];
+    let oidField: string | undefined;
+    const toCollection = (): FeatureCollection => ({
+      type: "FeatureCollection",
+      features: graphics.flatMap((graphic) => {
+        const geometry = this.graphicGeometryToGeoJson(graphic.geometry);
+        // The service's object id is the feature's identity, as identify
+        // reports it.
+        const oid = oidField ? graphic.attributes?.[oidField] : undefined;
+        return geometry
+          ? [
+              {
+                type: "Feature" as const,
+                ...(typeof oid === "string" || typeof oid === "number" ? { id: oid } : {}),
+                properties: stripSyntheticFields(graphic.attributes ?? {}),
+                geometry,
+              },
+            ]
+          : [];
+      }),
+    });
+    try {
+      // The service's metadata (object id field, capabilities) is read from
+      // the loaded layer.
+      await native.when();
+      // A stable order, so offset pages neither overlap nor skip rows — where
+      // the service supports ORDER BY at all.
+      oidField = (native as { objectIdField?: string }).objectIdField;
+      const orderBy =
+        (native as { capabilities?: { query?: { supportsOrderBy?: boolean } } }).capabilities?.query
+          ?.supportsOrderBy === true;
+      let firstOfPreviousPage: string | undefined;
+      // The SDK's query asks for 10 rows once `start` is set unless told
+      // otherwise; later pages ask for as many as the first page returned
+      // (the service's per-request limit).
+      let pageSize = 0;
+      for (let page = 0; page < SERVICE_GEOJSON_MAX_PAGES; page++) {
+        const result = await native.queryFeatures({
+          where: "1=1",
+          outFields: ["*"],
+          returnGeometry: true,
+          outSpatialReference: { wkid: 4326 },
+          ...(oidField && orderBy ? { orderByFields: [oidField] } : {}),
+          ...(graphics.length ? { start: graphics.length, num: pageSize } : {}),
+        });
+        if (page === 0) pageSize = result.features.length;
+        // A service that ignores the offset returns its first page again;
+        // stop rather than repeat it.
+        const first = JSON.stringify(result.features[0]?.attributes ?? null);
+        if (page > 0 && first === firstOfPreviousPage) break;
+        firstOfPreviousPage = first;
+        graphics.push(...result.features);
+        if (!result.exceededTransferLimit || !result.features.length) break;
+      }
+      return toCollection();
+    } catch {
+      // A page failing part way still returns what was read before it.
+      return graphics.length ? toCollection() : null;
+    }
   }
   /**
    * The store record's tile templates as plain HTTP(S) URLs, as a story export
@@ -1682,14 +1770,13 @@ export class ArcgisEngine implements MapEngine {
       const rawId = attributes[ARCGIS_ID_FIELD];
       // A service layer's features never live in the store; their object id
       // is the identity the SDK offers.
-      const featureId =
-        rawId != null
-          ? String(rawId)
-          : attributes.OBJECTID != null
-            ? String(attributes.OBJECTID)
-            : attributes.__OBJECTID != null
-              ? String(attributes.__OBJECTID)
-              : null;
+      // The service names its own object id field (`objectid`, `FID`, ...).
+      const oidField = (native as { objectIdField?: string } | null)?.objectIdField;
+      const oid =
+        (oidField ? attributes[oidField] : undefined) ??
+        attributes.OBJECTID ??
+        attributes.__OBJECTID;
+      const featureId = rawId != null ? String(rawId) : oid != null ? String(oid) : null;
       const feature =
         rawId != null
           ? storeLayer?.geojson?.features.find((f, i) => String(f.id ?? i) === featureId)
@@ -1697,13 +1784,21 @@ export class ArcgisEngine implements MapEngine {
       const key = `${storeId}:${featureId ?? JSON.stringify(attributes)}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const hitGeometry =
+        feature?.geometry ?? this.graphicGeometryToGeoJson(result.graphic.geometry);
+      if (!feature && featureId !== null && hitGeometry) {
+        this.serviceGeometries.delete(`${storeId}:${featureId}`);
+        this.serviceGeometries.set(`${storeId}:${featureId}`, hitGeometry);
+        if (this.serviceGeometries.size > 500)
+          this.serviceGeometries.delete(this.serviceGeometries.keys().next().value!);
+      }
       features.push({
         layerId: storeId,
         featureId,
         properties: feature?.properties ?? stripSyntheticFields(attributes),
         // The store's geometry when the feature is there; otherwise the one
         // the hit test found (a service layer's), converted from the view.
-        geometry: feature?.geometry ?? this.graphicGeometryToGeoJson(result.graphic.geometry),
+        geometry: hitGeometry,
       });
     }
     try {
@@ -1913,9 +2008,16 @@ export class ArcgisEngine implements MapEngine {
   ): void {
     this.clearFeatureHighlight();
     const map = this.map;
-    if (!map || !layer?.geojson || featureId === null) return;
+    if (!map || !layer || featureId === null) return;
     const ids = new Set(Array.isArray(featureId) ? featureId : [featureId]);
-    const selected = layer.geojson.features.filter((f, i) => ids.has(String(f.id ?? i)));
+    // A service layer's features are on the server; the ones identify hit
+    // left their geometry behind for this.
+    const selected: Feature[] = layer.geojson
+      ? layer.geojson.features.filter((f, i) => ids.has(String(f.id ?? i)))
+      : [...ids].flatMap((id) => {
+          const geometry = this.serviceGeometries.get(`${layer.id}:${id}`);
+          return geometry ? [{ type: "Feature" as const, id, properties: {}, geometry }] : [];
+        });
     if (!selected.length) return;
     const plan = this.natives.get(layer.id)?.plan;
     const elevated = plan?.kind === "geojson" && plan.parts.some((part) => part.hasZ);

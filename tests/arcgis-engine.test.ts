@@ -909,7 +909,7 @@ describe("ArcgisEngine layer sync", () => {
     });
     engine.syncLayers([
       service("tiled", "https://h/rest/services/A/MapServer/", { arcgisTiled: true }),
-      service("dynamic", "https://h/rest/services/B/MapServer/3"),
+      service("dynamic", "https://h/rest/services/B/MapServer"),
       service("imagery", "https://h/rest/services/C/ImageServer"),
     ]);
     assert.deepEqual(engine.getLayerRasterSource("tiled")?.tiles, [
@@ -1111,6 +1111,102 @@ describe("ArcgisEngine picking and highlight", () => {
     assert.equal(feature.featureId, "7");
     assert.deepEqual(feature.properties, { OBJECTID: 7, NAME: "Parcel" });
     assert.equal(feature.geometry?.type, "Polygon");
+  });
+  it("styles, highlights and reads back a native FeatureServer layer", async () => {
+    const { engine, layers, setHitResults, map } = makeEngine();
+    const record = {
+      ...geojsonLayer({ id: "fs", name: "Service", geojson: undefined }),
+      type: "arcgis" as const,
+      source: { type: "geojson", url: "https://h/rest/services/X/FeatureServer/0" },
+    };
+    // The layer draws with its style once the service's geometry type is known.
+    engine.syncLayers([{ ...record, style: { ...DEFAULT_LAYER_STYLE, fillColor: "#ff0000" } }]);
+    const service = layers.items[0] as (typeof layers.items)[0] & {
+      geometryType?: string;
+      queryFeatures?: unknown;
+    };
+    service.geometryType = "polygon";
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const renderer = service.renderer as { symbol: { type: string; color: number[] } };
+    assert.equal(renderer.symbol.type, "simple-fill");
+    assert.deepEqual(renderer.symbol.color.slice(0, 3), [255, 0, 0]);
+    // A hit leaves the feature's geometry behind for its highlight.
+    setHitResults([
+      {
+        type: "graphic",
+        graphic: {
+          attributes: { OBJECTID: 7 },
+          layer: service,
+          geometry: {
+            type: "polygon",
+            rings: [
+              [
+                [0, 0],
+                [1, 0],
+                [1, 1],
+                [0, 0],
+              ],
+            ],
+            spatialReference: { wkid: 4326 },
+          },
+        },
+      },
+    ]);
+    await engine.identifyFeaturesAt({ x: 0, y: 0 });
+    const before = (map.layers as unknown as { items: unknown[] }).items.length;
+    engine.highlightFeature(engine["layers"][0], "7");
+    assert.equal((map.layers as unknown as { items: unknown[] }).items.length, before + 1);
+    // GeoJSON comes from a service query.
+    service.queryFeatures = async () => ({
+      features: [
+        {
+          attributes: { OBJECTID: 1, NAME: "A" },
+          geometry: { type: "point", x: 3, y: 4, spatialReference: { wkid: 4326 } },
+          layer: null,
+        },
+      ],
+    });
+    (service as { objectIdField?: string }).objectIdField = "OBJECTID";
+    const collection = await engine.getLayerGeoJson("fs");
+    assert.equal(collection?.features.length, 1);
+    assert.equal(collection?.features[0].id, 1);
+    assert.deepEqual(collection?.features[0].properties, { OBJECTID: 1, NAME: "A" });
+    // A service past its record limit is paged.
+    const starts: unknown[] = [];
+    service.queryFeatures = async (query: { start?: number; num?: number }) => {
+      starts.push(query.start === undefined ? undefined : [query.start, query.num]);
+      const start = query.start ?? 0;
+      return {
+        exceededTransferLimit: start === 0,
+        features: [
+          {
+            attributes: { OBJECTID: start + 1 },
+            geometry: { type: "point", x: 3, y: 4, spatialReference: { wkid: 4326 } },
+            layer: null,
+          },
+        ],
+      };
+    };
+    assert.equal((await engine.getLayerGeoJson("fs"))?.features.length, 2);
+    // Later pages ask for as many rows as the first page returned.
+    assert.deepEqual(starts, [undefined, [1, 1]]);
+    // A service that ignores the offset keeps sending its first page: stop.
+    let calls = 0;
+    service.queryFeatures = async () => {
+      calls++;
+      return {
+        exceededTransferLimit: true,
+        features: [
+          {
+            attributes: { OBJECTID: 1 },
+            geometry: { type: "point", x: 3, y: 4, spatialReference: { wkid: 4326 } },
+            layer: null,
+          },
+        ],
+      };
+    };
+    assert.equal((await engine.getLayerGeoJson("fs"))?.features.length, 1);
+    assert.equal(calls, 2);
   });
   it("keeps synchronous control results when a native hit test outlives the engine", async () => {
     const { setArcgisControlPicker } = await import("../packages/map/src/arcgis-control-adapters");
