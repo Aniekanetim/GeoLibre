@@ -2469,6 +2469,47 @@ export class ArcgisEngine implements MapEngine {
       this.handles.delete(handle);
     };
   }
+  /**
+   * Unlike ArcgisCanvas's module-level `whenDrawn`, which waits for the
+   * basemap only (for the loading indicator), this waits for the whole view,
+   * data layers included, as a capture needs.
+   */
+  whenDrawn(timeoutMs: number): Promise<void> {
+    const view = this.view;
+    if (!view) return Promise.resolve();
+    return new Promise((resolve) => {
+      let finished = false;
+      let handle: ArcgisHandle | undefined;
+      let frame = 0;
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        cancelAnimationFrame(frame);
+        if (handle) {
+          handle.remove();
+          this.handles.delete(handle);
+        }
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      // Two frames first, as the canvas's own whenDrawn waits: right after a
+      // jump the layer views have not scheduled the new extent's tiles, and
+      // `updating` still reads false.
+      frame = requestAnimationFrame(
+        () =>
+          (frame = requestAnimationFrame(() => {
+            if (finished || this.view !== view) return done();
+            handle = this.sdk.reactiveUtils.when(() => view.stationary && !view.updating, done, {
+              initial: true,
+            });
+            // Torn down with the view, like the class's other subscriptions.
+            if (finished) handle.remove();
+            else this.handles.add(handle);
+          })),
+      );
+    });
+  }
   onCameraIdle(listener: (event?: CameraIdleEvent) => void): () => void {
     const view = this.view;
     if (!view) return () => {};
