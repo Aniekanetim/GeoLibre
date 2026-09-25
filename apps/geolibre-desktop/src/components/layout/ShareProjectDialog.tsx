@@ -19,6 +19,7 @@ import {
   ExternalLink,
   KeyRound,
   Loader2,
+  LogIn,
   Share2,
   TriangleAlert,
 } from "lucide-react";
@@ -26,6 +27,14 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useDesktopSettingsStore } from "../../hooks/useDesktopSettings";
 import { openExternalLink } from "../../lib/open-external";
+import {
+  getShareAccessToken,
+  ShareOAuthError,
+  shareOAuthErrorKey,
+  signInToShare,
+  supportsShareOAuth,
+  useShareOAuthStore,
+} from "../../lib/share-oauth";
 import {
   isShareableTitle,
   MAX_PROJECT_TITLE_LENGTH,
@@ -224,6 +233,13 @@ export function ShareProjectDialog({
   // Named in the copy below, so a self-hosted deployment reads its own host.
   const shareHost = shareHostLabel();
   const shareToken = useDesktopSettingsStore((s) => s.desktopSettings.shareToken);
+  // Web-only OAuth session. On desktop/embed both flags stay inert and the
+  // pasted personal-API-token path below behaves exactly as before Stack 3.
+  const oauthSupported = supportsShareOAuth();
+  const oauthIssuer = useShareOAuthStore((s) => s.issuer);
+  const oauthPending = useShareOAuthStore((s) => s.pending);
+  const oauthSignedIn = oauthSupported && oauthIssuer !== null;
+  const [oauthError, setOauthError] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [visibility, setVisibility] = useState<ShareVisibility>("public");
   const [status, setStatus] = useState<"idle" | "uploading">("idle");
@@ -240,7 +256,7 @@ export function ShareProjectDialog({
   const getTokenButtonRef = useRef<HTMLButtonElement>(null);
   const copyTimeoutRef = useRef<number | null>(null);
 
-  const hasToken = shareToken.trim().length > 0;
+  const hasToken = oauthSignedIn || shareToken.trim().length > 0;
   const titleValid = isShareableTitle(title);
   // The verdicts that are missing for everyone have their own block above the
   // form, so the probe report lists the rest: what the network settled, plus a
@@ -269,6 +285,7 @@ export function ShareProjectDialog({
       setResult(null);
       setCopied(false);
       setRedactedCount(0);
+      setOauthError(null);
     } else {
       abortRef.current?.abort();
       abortRef.current = null;
@@ -318,6 +335,22 @@ export function ShareProjectDialog({
     [],
   );
 
+  // Web sign-in opens the consent popup. Failures surface as translated
+  // guidance keyed by ShareOAuthError code; the session store updates on
+  // success, which re-runs the readiness probe effect below (hasToken flips).
+  const handleSignIn = () => {
+    setOauthError(null);
+    signInToShare()
+      .then(() => {
+        setErrorCode((code) => (code === "unauthorized" ? null : code));
+      })
+      .catch((err: unknown) => {
+        setOauthError(
+          t(err instanceof ShareOAuthError ? shareOAuthErrorKey(err.code) : "share.oauthFailed"),
+        );
+      });
+  };
+
   const handleShare = async () => {
     // Guard re-entry synchronously: a second click before the disabled state
     // renders would otherwise start a concurrent, non-idempotent upload.
@@ -328,9 +361,30 @@ export function ShareProjectDialog({
     const controller = new AbortController();
     abortRef.current = controller;
     try {
+      // Prefer OAuth; a pasted personal token remains a fallback when OAuth is
+      // unavailable or its refresh endpoint is temporarily unreachable.
+      let oauthToken: string | null = null;
+      if (oauthSupported) {
+        try {
+          oauthToken = await getShareAccessToken();
+        } catch (err) {
+          if (
+            !(err instanceof ShareOAuthError) ||
+            err.code !== "refresh-unavailable" ||
+            !shareToken.trim()
+          ) {
+            throw err;
+          }
+        }
+      }
+      if (oauthSupported && !oauthToken && !shareToken.trim()) {
+        setErrorCode("unauthorized");
+        setError(null);
+        return;
+      }
       const { content, filename, redactedCount: removed = 0 } = await getProject(title.trim());
       const uploaded = await uploadProjectToShare({
-        token: shareToken,
+        token: oauthToken ?? shareToken,
         filename,
         content,
         visibility,
@@ -342,12 +396,20 @@ export function ShareProjectDialog({
       if (err instanceof DOMException && err.name === "AbortError") return;
       // A missing account username gets dedicated, actionable UI (a deep link to
       // the website's settings) rather than the raw server string.
-      if (err instanceof ShareUploadError && err.code === "username-required") {
-        setErrorCode("username-required");
+      if (
+        err instanceof ShareUploadError &&
+        (err.code === "username-required" || err.code === "unauthorized")
+      ) {
+        setErrorCode(err.code);
         setError(null);
       } else {
-        setError(err instanceof Error ? err.message : t("share.errorFallback"));
-        setErrorCode(null);
+        setError(
+          err instanceof ShareOAuthError
+            ? t(shareOAuthErrorKey(err.code))
+            : err instanceof Error
+              ? err.message
+              : t("share.errorFallback"),
+        );
       }
     } finally {
       // Only the controller that is still current clears state, so an aborted
@@ -430,6 +492,32 @@ export function ShareProjectDialog({
         {!hasToken ? (
           <div className="space-y-4 text-sm">
             <LocalDataWarning problems={localProblems} shareHost={shareHost} />
+            {oauthSupported ? (
+              <div className="space-y-2 rounded-md border p-3">
+                <p className="font-medium">{t("share.oauthTitle")}</p>
+                <p className="text-muted-foreground">
+                  {t("share.oauthSetupDescription", { shareHost })}
+                </p>
+                <Button
+                  ref={oauthSupported ? getTokenButtonRef : undefined}
+                  type="button"
+                  onClick={handleSignIn}
+                  disabled={oauthPending}
+                >
+                  {oauthPending ? (
+                    <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <LogIn className="me-2 h-3.5 w-3.5" />
+                  )}
+                  {oauthPending ? t("share.oauthSigningIn") : t("share.oauthSignIn", { shareHost })}
+                </Button>
+                {oauthError ? (
+                  <p role="alert" className="text-xs text-destructive">
+                    {oauthError}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
             <p className="text-muted-foreground">{t("share.setupIntro", { shareHost })}</p>
             <ol className="space-y-3">
               <li className="space-y-2 rounded-md border p-3">
@@ -438,7 +526,7 @@ export function ShareProjectDialog({
                   {t("share.step1Description", { shareHost })}
                 </p>
                 <Button
-                  ref={getTokenButtonRef}
+                  ref={oauthSupported ? undefined : getTokenButtonRef}
                   type="button"
                   variant="outline"
                   onClick={() => void openExternalLink(settingsUrl)}
@@ -565,7 +653,46 @@ export function ShareProjectDialog({
               </p>
             ) : null}
 
-            {errorCode === "username-required" ? (
+            {errorCode === "unauthorized" ? (
+              <div
+                role="alert"
+                className="space-y-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive"
+              >
+                <p>
+                  {t(oauthSupported ? "share.reauthBody" : "share.errorUnauthorized", {
+                    shareHost,
+                  })}
+                </p>
+                {oauthSupported ? (
+                  <>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleSignIn}
+                      disabled={oauthPending}
+                    >
+                      {oauthPending ? (
+                        <Loader2 className="me-2 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <LogIn className="me-2 h-3.5 w-3.5" />
+                      )}
+                      {t("share.reauthSignIn")}
+                    </Button>
+                    {oauthError ? (
+                      <p role="alert" className="text-xs text-destructive">
+                        {oauthError}
+                      </p>
+                    ) : null}
+                  </>
+                ) : (
+                  <Button type="button" variant="outline" size="sm" onClick={handleConfigureToken}>
+                    <KeyRound className="me-2 h-3.5 w-3.5" />
+                    {t("share.configureToken")}
+                  </Button>
+                )}
+              </div>
+            ) : errorCode === "username-required" ? (
               <div
                 role="alert"
                 className="space-y-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive"
